@@ -535,7 +535,7 @@ func resetAntigravityReasoningReplayMemoryOnly(t *testing.T) {
 func TestAntigravityReplayDiskRestartHydration(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-restart"
 	item := antigravityReplayTestItem("disk-restart-signature-123456")
@@ -566,7 +566,7 @@ func TestAntigravityReplayDiskRestartHydration(t *testing.T) {
 func TestAntigravityReplayDiskReplacementPersists(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-replace"
 	prefix := antigravityReplayTestItem("disk-replace-prefix-123456")
@@ -591,7 +591,7 @@ func TestAntigravityReplayDiskReplacementPersists(t *testing.T) {
 func TestAntigravityReplayDiskConditionalDeleteRemovesFile(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-cond-delete"
 	item := antigravityReplayTestItem("disk-cond-delete-signature-123456")
@@ -621,7 +621,7 @@ func TestAntigravityReplayDiskConditionalDeleteRemovesFile(t *testing.T) {
 func TestAntigravityReplayDiskUnconditionalDeleteRemovesFile(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-unc-delete"
 	item := antigravityReplayTestItem("disk-unc-delete-signature-123456")
@@ -647,7 +647,7 @@ func TestAntigravityReplayDiskUnconditionalDeleteRemovesFile(t *testing.T) {
 func TestAntigravityReplayDiskExpiryCleanupRemovesFile(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-expiry"
 	item := antigravityReplayTestItem("disk-expiry-signature-123456")
@@ -688,7 +688,7 @@ func TestAntigravityReplayDiskExpiryCleanupRemovesFile(t *testing.T) {
 func TestAntigravityReplayDiskClearRemovesFiles(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model = "gemini-3.6-flash-high"
 	for _, session := range []string{"disk-clear-1", "disk-clear-2", "disk-clear-3"} {
@@ -711,7 +711,7 @@ func TestAntigravityReplayDiskClearRemovesFiles(t *testing.T) {
 func TestAntigravityReplayDiskCorruptFileIsMissNotProvenance(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-corrupt"
 	item := antigravityReplayTestItem("disk-corrupt-signature-123456")
@@ -735,7 +735,7 @@ func TestAntigravityReplayDiskCorruptFileIsMissNotProvenance(t *testing.T) {
 func TestAntigravityReplayDiskHydratedSnapshotFencesStaleMutation(t *testing.T) {
 	ClearAntigravityReasoningReplayCache()
 	t.Cleanup(ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	useAntigravityReasoningReplayDiskRoot(t, root)
 	const model, session = "gemini-3.6-flash-high", "disk-fence"
 	oldItem := antigravityReplayTestItem("disk-fence-old-signature-123456")
@@ -833,5 +833,166 @@ func TestAntigravityReplayCacheEmptyRootDisablesPersistence(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("write with empty root persisted %d files, want 1", len(entries))
+	}
+}
+
+func TestAntigravityReplayCacheRootRotationClearsMemoryEntries(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	rootA := antigravityReplayDiskTestRoot(t)
+	rootB := antigravityReplayDiskTestRoot(t)
+	useAntigravityReasoningReplayDiskRoot(t, rootA)
+	const model, session = "gemini-3.6-flash-high", "root-rotation"
+	oldItem := antigravityReplayTestItem("root-a-old-signature-123456")
+	newItem := antigravityReplayTestItem("root-b-new-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{oldItem}) {
+		t.Fatal("cache write under root A failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 {
+		t.Fatalf("entry under root A not readable: %q found=%v", items, ok)
+	}
+
+	// Rotating the root must neither serve nor re-persist root-A state.
+	SetAntigravityReasoningReplayCacheRoot(rootB)
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); ok || len(items) != 0 {
+		t.Fatalf("root-A memory entry served under root B: %q found=%v", items, ok)
+	}
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{newItem}) {
+		t.Fatal("cache write under root B failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 || !bytes.Contains(items[0], []byte("root-b-new")) {
+		t.Fatalf("root-B entry not served: %q found=%v", items, ok)
+	}
+	loadedB, foundB := newAntigravityReasoningReplayDiskStore(rootB).load(model, session, time.Now())
+	if !foundB || len(loadedB.Items) != 1 || !bytes.Contains(loadedB.Items[0], []byte("root-b-new")) {
+		t.Fatalf("root-B persisted entry wrong: %q found=%v", loadedB.Items, foundB)
+	}
+	// Files under the previous root are not migrated or rewritten.
+	loadedA, foundA := newAntigravityReasoningReplayDiskStore(rootA).load(model, session, time.Now())
+	if !foundA || len(loadedA.Items) != 1 || !bytes.Contains(loadedA.Items[0], []byte("root-a-old")) {
+		t.Fatalf("root-A persisted file changed after rotation: %q found=%v", loadedA.Items, foundA)
+	}
+}
+
+func TestAntigravityReplayCacheRootDisabledClearsMemoryEntries(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := antigravityReplayDiskTestRoot(t)
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "root-disabled"
+	item := antigravityReplayTestItem("root-disabled-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 {
+		t.Fatalf("entry not readable: %q found=%v", items, ok)
+	}
+	// Disabling local persistence (Home transition) must drop in-memory state
+	// that belongs to the disk-backed boundary.
+	SetAntigravityReasoningReplayCacheRoot("")
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); ok || len(items) != 0 {
+		t.Fatalf("disk-boundary entry served after root disabled: %q found=%v", items, ok)
+	}
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("in-memory write with disabled root failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 {
+		t.Fatalf("in-memory entry not readable after root disabled: %q found=%v", items, ok)
+	}
+}
+
+func TestAntigravityReplayCacheRootReenabledClearsMemoryEntries(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	const model, session = "gemini-3.6-flash-high", "root-reenabled"
+	item := antigravityReplayTestItem("root-reenabled-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write with disabled root failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 {
+		t.Fatalf("memory entry not readable: %q found=%v", items, ok)
+	}
+	// Re-enabling standalone persistence must not carry the memory entry into
+	// the new root boundary.
+	rootB := antigravityReplayDiskTestRoot(t)
+	useAntigravityReasoningReplayDiskRoot(t, rootB)
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); ok || len(items) != 0 {
+		t.Fatalf("pre-existing memory entry served after root re-enabled: %q found=%v", items, ok)
+	}
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write with re-enabled root failed")
+	}
+	loadedB, foundB := newAntigravityReasoningReplayDiskStore(rootB).load(model, session, time.Now())
+	if !foundB || len(loadedB.Items) != 1 || !bytes.Contains(loadedB.Items[0], []byte("root-reenabled-signature")) {
+		t.Fatalf("re-enabled root persisted entry wrong: %q found=%v", loadedB.Items, foundB)
+	}
+}
+
+func TestAntigravityReplayCacheSameRootUpdatePreservesMemoryEntries(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := antigravityReplayDiskTestRoot(t)
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "same-root"
+	item := antigravityReplayTestItem("same-root-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 {
+		t.Fatalf("entry not readable: %q found=%v", items, ok)
+	}
+	// Reapplying the same root (repeated config updates) must not clear state.
+	SetAntigravityReasoningReplayCacheRoot(root)
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); !ok || len(items) != 1 {
+		t.Fatalf("same-root reapply cleared the entry: %q found=%v", items, ok)
+	}
+	path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("same-root reapply removed the persisted file: %v", errStat)
+	}
+}
+
+func TestAntigravityReplayDiskEvictionRemovesFile(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := antigravityReplayDiskTestRoot(t)
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model = "gemini-3.6-flash-high"
+	item := antigravityReplayTestItem("eviction-signature-123456")
+	sessions := []string{"evict-oldest", "evict-middle", "evict-newest"}
+	for _, session := range sessions {
+		if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+			t.Fatal("cache write failed")
+		}
+	}
+	// Make the eviction order deterministic: oldest entry first.
+	now := time.Now()
+	antigravityReasoningReplayMu.Lock()
+	for index, session := range sessions {
+		key := antigravityReasoningReplayCacheKey(model, session)
+		entry := antigravityReasoningReplayEntries[key]
+		entry.Timestamp = now.Add(time.Duration(index-2) * time.Hour)
+		antigravityReasoningReplayEntries[key] = entry
+	}
+	antigravityReasoningReplayMu.Unlock()
+
+	evictOldestAntigravityReasoningReplayEntries(1)
+
+	oldestPath, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, sessions[0])
+	if _, errStat := os.Lstat(oldestPath); !os.IsNotExist(errStat) {
+		t.Fatalf("evicted entry's persisted file survives memory eviction: %v", errStat)
+	}
+	for _, session := range sessions[1:] {
+		path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+		if _, errStat := os.Lstat(path); errStat != nil {
+			t.Fatalf("non-evicted entry %q lost its persisted file: %v", session, errStat)
+		}
+	}
+	oldestKey := antigravityReasoningReplayCacheKey(model, sessions[0])
+	antigravityReasoningReplayMu.Lock()
+	_, stillPresent := antigravityReasoningReplayEntries[oldestKey]
+	antigravityReasoningReplayMu.Unlock()
+	if stillPresent {
+		t.Fatal("evicted entry still resident in memory")
 	}
 }

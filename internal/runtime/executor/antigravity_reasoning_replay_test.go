@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1488,7 +1489,7 @@ func TestPrepareAntigravityGeminiReasoningReplayFailsClosedWithoutClaudeToolProv
 func TestPrepareAntigravityGeminiReasoningReplayFailsClosedForUnknownClaudeToolWithDiskRoot(t *testing.T) {
 	internalcache.ClearAntigravityReasoningReplayCache()
 	t.Cleanup(internalcache.ClearAntigravityReasoningReplayCache)
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), "antigravity-replay")
 	internalcache.SetAntigravityReasoningReplayCacheRoot(root)
 	t.Cleanup(func() { internalcache.SetAntigravityReasoningReplayCacheRoot("") })
 

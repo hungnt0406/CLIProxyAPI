@@ -26,8 +26,18 @@ func antigravityReplayDiskTestEntry(timestamp time.Time, deleted bool) antigravi
 	}
 }
 
+// antigravityReplayDiskTestRoot returns a fresh cache root for tests. The
+// store itself creates the directory with owner-only permissions, mirroring
+// production wiring (`<AuthDir>/antigravity-replay`). t.TempDir() cannot be
+// used directly as a store root because the testing package creates it with
+// group/other access bits, which the store must reject.
+func antigravityReplayDiskTestRoot(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "antigravity-replay")
+}
+
 func TestAntigravityReplayDiskRoundTripFreshStore(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	const model, session = "gemini-3.6-flash-high", "../sessions/private-123"
 	entry := antigravityReplayDiskTestEntry(time.Now().Truncate(time.Millisecond), false)
 
@@ -84,7 +94,7 @@ func TestAntigravityReplayDiskRoundTripFreshStore(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskKeyIsolation(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	if errSave := store.save("model-a", "session-1", antigravityReplayDiskTestEntry(time.Now(), false)); errSave != nil {
 		t.Fatal(errSave)
@@ -101,7 +111,7 @@ func TestAntigravityReplayDiskKeyIsolation(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskDeletedFlagRoundTrip(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	entry := antigravityReasoningReplayEntry{
 		Timestamp: time.Now().Truncate(time.Millisecond),
@@ -141,7 +151,7 @@ func TestAntigravityReplayDiskFileNameIsHashed(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsCorruptJSON(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	if errSave := store.save("model", "session", antigravityReplayDiskTestEntry(time.Now(), false)); errSave != nil {
 		t.Fatal(errSave)
@@ -159,7 +169,7 @@ func TestAntigravityReplayDiskRejectsCorruptJSON(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsExpiredEntry(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	expired := antigravityReplayDiskTestEntry(time.Now().Add(-2*AntigravityReasoningReplayCacheTTL), false)
 	if errSave := store.save("model", "session", expired); errSave != nil {
@@ -183,7 +193,7 @@ func TestAntigravityReplayDiskRejectsExpiredEntry(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsOversizedFile(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	if errSave := store.save("model", "session", antigravityReplayDiskTestEntry(time.Now(), false)); errSave != nil {
 		t.Fatal(errSave)
@@ -207,7 +217,7 @@ func TestAntigravityReplayDiskRejectsOversizedFile(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsOversizedPayload(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	big := bytes.Repeat([]byte("a"), AntigravityReasoningReplayCacheMaxBytesPerEntry+1)
 	raw, errMarshal := json.Marshal(antigravityReasoningReplayDiskFile{
@@ -235,7 +245,7 @@ func TestAntigravityReplayDiskRejectsOversizedPayload(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsTooManyItems(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	items := make([][]byte, AntigravityReasoningReplayCacheMaxItemsPerEntry+1)
 	for index := range items {
@@ -266,7 +276,7 @@ func TestAntigravityReplayDiskRejectsTooManyItems(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsUnsafeFileMode(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	if errSave := store.save("model", "session", antigravityReplayDiskTestEntry(time.Now(), false)); errSave != nil {
 		t.Fatal(errSave)
@@ -284,7 +294,7 @@ func TestAntigravityReplayDiskRejectsUnsafeFileMode(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskRejectsUnknownFields(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	timestamp := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
 	raw := []byte(`{"items":[["YQ=="]],"timestamp":"` + timestamp + `","revision":1,"branch":"b","deleted":false,"sneaky":1}`)
@@ -304,7 +314,7 @@ func TestAntigravityReplayDiskRejectsUnknownFields(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskFailedReplacementPreservesPriorFile(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	old := antigravityReplayDiskTestEntry(time.Now().Add(-time.Minute), false)
 	old.Branch = "prior-branch"
@@ -334,7 +344,7 @@ func TestAntigravityReplayDiskFailedReplacementPreservesPriorFile(t *testing.T) 
 }
 
 func TestAntigravityReplayDiskDeleteRemovesEntry(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	if errSave := store.save("model", "session", antigravityReplayDiskTestEntry(time.Now(), false)); errSave != nil {
 		t.Fatal(errSave)
@@ -355,7 +365,7 @@ func TestAntigravityReplayDiskDeleteRemovesEntry(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskClearRemovesAllEntries(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	for index := 0; index < 3; index++ {
 		if errSave := store.save("model", fmt.Sprintf("session-%d", index), antigravityReplayDiskTestEntry(time.Now(), false)); errSave != nil {
@@ -379,7 +389,7 @@ func TestAntigravityReplayDiskClearRemovesAllEntries(t *testing.T) {
 }
 
 func TestAntigravityReplayDiskSaveRejectsInvalidInput(t *testing.T) {
-	root := t.TempDir()
+	root := antigravityReplayDiskTestRoot(t)
 	store := newAntigravityReasoningReplayDiskStore(root)
 	tooMany := make([][]byte, AntigravityReasoningReplayCacheMaxItemsPerEntry+1)
 	for index := range tooMany {
@@ -407,5 +417,76 @@ func TestAntigravityReplayDiskSaveRejectsInvalidInput(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("invalid saves wrote %d files", len(entries))
+	}
+}
+
+func TestAntigravityReplayDiskRejectsUnsafeExistingRootPermissions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "unsafe-root")
+	if errMkdir := os.Mkdir(root, 0o755); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	if info, errStat := os.Stat(root); errStat != nil || info.Mode().Perm()&0o077 == 0 {
+		t.Fatalf("test root not group/other-accessible: %v", errStat)
+	}
+	store := newAntigravityReasoningReplayDiskStore(root)
+	entry := antigravityReplayDiskTestEntry(time.Now(), false)
+	if errSave := store.save("model", "session", entry); errSave == nil {
+		t.Fatal("save into a 0755 cache root unexpectedly succeeded")
+	}
+	if _, found := store.load("model", "session", time.Now()); found {
+		t.Fatal("load from a 0755 cache root unexpectedly returned a hit")
+	}
+	if errDelete := store.delete("model", "session"); errDelete == nil {
+		t.Fatal("delete from a 0755 cache root unexpectedly succeeded")
+	}
+	if info, errStat := os.Stat(root); errStat != nil || !info.IsDir() {
+		t.Fatalf("unsafe cache root was modified: %v", errStat)
+	}
+	if entries, errList := os.ReadDir(root); errList != nil || len(entries) != 0 {
+		t.Fatalf("unsafe cache root gained entries: %v, err %v", entries, errList)
+	}
+}
+
+func TestAntigravityReplayDiskRejectsSymlinkRoot(t *testing.T) {
+	target := t.TempDir()
+	root := filepath.Join(t.TempDir(), "linked-root")
+	if errSymlink := os.Symlink(target, root); errSymlink != nil {
+		t.Fatal(errSymlink)
+	}
+	store := newAntigravityReasoningReplayDiskStore(root)
+	entry := antigravityReplayDiskTestEntry(time.Now(), false)
+	if errSave := store.save("model", "session", entry); errSave == nil {
+		t.Fatal("save through a symlinked cache root unexpectedly succeeded")
+	}
+	if _, found := store.load("model", "session", time.Now()); found {
+		t.Fatal("load through a symlinked cache root unexpectedly returned a hit")
+	}
+	if errDelete := store.delete("model", "session"); errDelete == nil {
+		t.Fatal("delete through a symlinked cache root unexpectedly succeeded")
+	}
+	if info, errLstat := os.Lstat(root); errLstat != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("cache root symlink was modified: %v", errLstat)
+	}
+	if entries, errList := os.ReadDir(target); errList != nil || len(entries) != 0 {
+		t.Fatalf("symlinked cache root wrote %d files through the link, err %v", len(entries), errList)
+	}
+}
+
+func TestAntigravityReplayDiskFreshRootIsRealDirectoryWithOwnerOnlyPermissions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "nested", "antigravity-replay")
+	store := newAntigravityReasoningReplayDiskStore(root)
+	entry := antigravityReplayDiskTestEntry(time.Now(), false)
+	if errSave := store.save("model", "session", entry); errSave != nil {
+		t.Fatal(errSave)
+	}
+	info, errLstat := os.Lstat(root)
+	if errLstat != nil {
+		t.Fatal(errLstat)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		t.Fatalf("fresh cache root is not a real directory: mode %v", info.Mode())
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("fresh cache root permissions %o, want 0700", perm)
 	}
 }

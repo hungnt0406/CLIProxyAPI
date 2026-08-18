@@ -156,7 +156,7 @@ on local disk so resumed OpenCode conversations survive proxy restarts:
   directory: `rm -rf <auth-dir>/antigravity-replay`. The cache holds no
   conversation history, so it is safe to delete at any time; only replay
   continuity for in-flight conversations is lost. Entries not yet expired
-  (persisted less than one hour ago) are reloaded from disk on first access
+  (persisted no more than one hour ago) are reloaded from disk on first access
   after a restart.
 - **Home mode.** When Home mode is active, its KV store remains authoritative
   and the local directory is not used.

@@ -98,18 +98,31 @@ var currentAntigravityReasoningReplayKVClient = func() (antigravityReasoningRepl
 // changing the public cache API.
 //
 // [HOW]
-// 1. Trim the supplied directory.
-// 2. Store it under the cache lock; an empty value disables disk persistence.
+//  1. Trim the supplied directory.
+//  2. Ignore re-applications of the current root, preserving resident state.
+//  3. Otherwise store the new root, clear the in-memory map, and bump the
+//     eviction epoch so snapshots captured before the change fence out.
 //
 // [RULES / NOTES]
-// - Passing an empty root restores the original in-memory-only behavior.
-// - The root must be absolute and private; callers derive it from AuthDir.
+//   - Passing an empty root restores the original in-memory-only behavior.
+//   - A changed root moves the persistence boundary (auth-dir rotation, Home
+//     transition, or re-enabling standalone mode): resident entries belong to
+//     the previous boundary and are dropped so they can neither be served nor
+//     re-persisted under the new root. Files under the previous root are left
+//     untouched for manual removal.
+//   - The root must be absolute and private; callers derive it from AuthDir.
 //
 // @param dir absolute cache root (expected `<AuthDir>/antigravity-replay`).
 func SetAntigravityReasoningReplayCacheRoot(dir string) {
 	antigravityReasoningReplayMu.Lock()
 	defer antigravityReasoningReplayMu.Unlock()
-	antigravityReasoningReplayDiskRoot = strings.TrimSpace(dir)
+	dir = strings.TrimSpace(dir)
+	if dir == antigravityReasoningReplayDiskRoot {
+		return
+	}
+	antigravityReasoningReplayDiskRoot = dir
+	antigravityReasoningReplayEntries = make(map[string]antigravityReasoningReplayEntry)
+	antigravityReasoningReplayEvictionEpoch++
 }
 
 // antigravityReasoningReplayDiskStoreFor returns the active disk store for
@@ -910,6 +923,24 @@ func cloneAntigravityReasoningReplayItems(items [][]byte) [][]byte {
 	return cloned
 }
 
+// evictOldestAntigravityReasoningReplayEntries removes the oldest resident
+// entries so process memory stays bounded.
+//
+// [WHY]
+// Eviction must not leave the evicted entries' persisted files behind
+// indefinitely: nothing else visits those keys, so the files would accumulate
+// until the directory is cleared manually.
+//
+// [HOW]
+// 1. Bail out on non-positive counts or an empty map.
+// 2. Collect all resident keys and sort them oldest-first.
+// 3. Delete the oldest entries and their persisted files.
+//
+// [RULES / NOTES]
+// - antigravityReasoningReplayMu must be held by the caller.
+// - Disk removal is best-effort; failures are logged at debug level.
+//
+// @param count the number of oldest entries to evict.
 func evictOldestAntigravityReasoningReplayEntries(count int) {
 	if count <= 0 || len(antigravityReasoningReplayEntries) == 0 {
 		return
@@ -931,6 +962,7 @@ func evictOldestAntigravityReasoningReplayEntries(count int) {
 	for i := 0; i < count; i++ {
 		antigravityReasoningReplayEvictionEpoch++
 		delete(antigravityReasoningReplayEntries, candidates[i].key)
+		antigravityReasoningReplayDiskDeleteKeyLocked(candidates[i].key)
 	}
 }
 

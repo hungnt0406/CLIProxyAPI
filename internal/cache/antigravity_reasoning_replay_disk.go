@@ -97,6 +97,87 @@ func (s *antigravityReasoningReplayDiskStore) pathFor(modelName, sessionKey stri
 	return filepath.Join(s.dir, fileName), true
 }
 
+// antigravityReasoningReplayDiskRootUsable reports whether an existing cache
+// root is a real directory with owner-only permissions. It never creates or
+// modifies the directory.
+//
+// [WHY]
+// Reads must fail closed against a root that was replaced by a symlink or
+// loosened to expose group/other access, without side effects of their own.
+//
+// [HOW]
+// 1. Lstat the root and treat any stat failure as unusable.
+// 2. Reject symlinks, non-directories, and group/other permission bits.
+//
+// @return true when the root is a real 0700-style directory.
+func (s *antigravityReasoningReplayDiskStore) rootUsable() bool {
+	info, errLstat := os.Lstat(s.dir)
+	if errLstat != nil {
+		return false
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return false
+	}
+	return true
+}
+
+// antigravityReasoningReplayDiskEnsureRoot makes the cache root usable for
+// writes: a missing directory is created with owner-only permissions, and an
+// existing root must be a real directory with 0700 permissions.
+//
+// [WHY]
+// The cache holds sensitive tool arguments and thought signatures; writing
+// through a symlinked or world-accessible root would either place state
+// outside the intended AuthDir boundary or expose it to other users.
+//
+// [HOW]
+// 1. Lstat the root; a missing root is created with MkdirAll(0700).
+// 2. Re-check the created path with Lstat before trusting it.
+// 3. Force owner-only permissions on a newly created directory.
+// 4. Reject symlinks, non-directories, and group/other permission bits.
+//
+// [RULES / NOTES]
+//   - MkdirAll follows symlinks, so the created path is Lstat-verified before
+//     any chmod or file operation.
+//   - An existing directory with unsafe permissions is rejected, never fixed.
+//
+// @return an error describing the unusable root, or nil when it is ready.
+func (s *antigravityReasoningReplayDiskStore) ensureRoot() error {
+	info, errLstat := os.Lstat(s.dir)
+	if os.IsNotExist(errLstat) {
+		if errMkdir := os.MkdirAll(s.dir, 0o700); errMkdir != nil {
+			return fmt.Errorf("antigravity replay disk: create cache directory: %w", errMkdir)
+		}
+		info, errLstat = os.Lstat(s.dir)
+		if errLstat != nil {
+			return fmt.Errorf("antigravity replay disk: stat created cache directory: %w", errLstat)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("antigravity replay disk: cache root %s is a symlink", s.dir)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("antigravity replay disk: cache root %s is not a directory", s.dir)
+		}
+		if errChmod := os.Chmod(s.dir, 0o700); errChmod != nil {
+			return fmt.Errorf("antigravity replay disk: secure cache directory: %w", errChmod)
+		}
+		return nil
+	}
+	if errLstat != nil {
+		return fmt.Errorf("antigravity replay disk: stat cache directory: %w", errLstat)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("antigravity replay disk: cache root %s is a symlink", s.dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("antigravity replay disk: cache root %s is not a directory", s.dir)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("antigravity replay disk: cache root %s permissions %o allow group/other access", s.dir, info.Mode().Perm())
+	}
+	return nil
+}
+
 // antigravityReasoningReplayDiskEntryValid reports whether an entry fits the
 // shared per-entry item and byte limits, keeping serialized writes bounded.
 //
@@ -133,14 +214,16 @@ func antigravityReasoningReplayDiskEntryValid(entry antigravityReasoningReplayEn
 //
 // [HOW]
 // 1. Reject blank keys and entries exceeding the per-entry limits.
-// 2. Create the cache directory with 0700 permissions.
+// 2. Ensure the cache root is a real 0700 directory, creating it if missing.
 // 3. JSON-encode only the replay entry fields.
 // 4. Write to a same-directory 0600 temp file, Sync, and close.
 // 5. Atomically rename the temp file over the target path.
 //
 // [RULES / NOTES]
-// - A failed write leaves any previously persisted entry untouched.
-// - The temp file is removed best-effort on every failure path.
+//   - A failed write leaves any previously persisted entry untouched.
+//   - The temp file is removed best-effort on every failure path.
+//   - A symlinked or group/other-accessible root fails the save; memory stays
+//     authoritative and the write is logged at debug level by the caller.
 //
 // @param modelName the upstream model name.
 // @param sessionKey the conversation continuity boundary.
@@ -154,8 +237,8 @@ func (s *antigravityReasoningReplayDiskStore) save(modelName, sessionKey string,
 	if !antigravityReasoningReplayDiskEntryValid(entry) {
 		return fmt.Errorf("antigravity replay disk save: entry exceeds per-entry item or byte limits")
 	}
-	if errMkdir := os.MkdirAll(s.dir, 0o700); errMkdir != nil {
-		return fmt.Errorf("antigravity replay disk save: create cache directory: %w", errMkdir)
+	if errRoot := s.ensureRoot(); errRoot != nil {
+		return fmt.Errorf("antigravity replay disk save: %w", errRoot)
 	}
 	data, errMarshal := json.Marshal(antigravityReasoningReplayDiskFile{
 		Items:     entry.Items,
@@ -205,13 +288,15 @@ func (s *antigravityReasoningReplayDiskStore) save(modelName, sessionKey string,
 // valid provenance; replay validation fails closed.
 //
 // [HOW]
-// 1. Resolve the hashed path and reject blank keys.
-// 2. Reject symlinks, non-regular files, and files with group/other bits.
-// 3. Reject files larger than the serialized byte bound.
-// 4. Strictly decode the entry JSON, rejecting unknown fields and trailing data.
-// 5. Reject entries over the item or byte limits.
-// 6. Reject entries older than the one-hour TTL.
-// 7. Remove rejected files best-effort and return a miss.
+//  1. Resolve the hashed path and reject blank keys.
+//  2. Reject a cache root that is missing, a symlink, not a directory, or
+//     accessible by group/other.
+//  3. Reject symlinks, non-regular files, and files with group/other bits.
+//  4. Reject files larger than the serialized byte bound.
+//  5. Strictly decode the entry JSON, rejecting unknown fields and trailing data.
+//  6. Reject entries over the item or byte limits.
+//  7. Reject entries older than the one-hour TTL.
+//  8. Remove rejected files best-effort and return a miss.
 //
 // [RULES / NOTES]
 // - Every rejection is a miss, never an error that can fabricate provenance.
@@ -224,6 +309,9 @@ func (s *antigravityReasoningReplayDiskStore) save(modelName, sessionKey string,
 func (s *antigravityReasoningReplayDiskStore) load(modelName, sessionKey string, now time.Time) (antigravityReasoningReplayEntry, bool) {
 	path, ok := s.pathFor(modelName, sessionKey)
 	if !ok {
+		return antigravityReasoningReplayEntry{}, false
+	}
+	if !s.rootUsable() {
 		return antigravityReasoningReplayEntry{}, false
 	}
 	info, errStat := os.Lstat(path)
@@ -288,7 +376,9 @@ func (s *antigravityReasoningReplayDiskStore) load(modelName, sessionKey string,
 //
 // [HOW]
 // 1. Resolve the hashed path and reject blank keys.
-// 2. Remove the file, treating a missing file as success.
+// 2. Treat a missing cache root as success (nothing persisted).
+// 3. Reject a symlinked or group/other-accessible root.
+// 4. Remove the file, treating a missing file as success.
 //
 // @param modelName the upstream model name.
 // @param sessionKey the conversation continuity boundary.
@@ -297,6 +387,16 @@ func (s *antigravityReasoningReplayDiskStore) delete(modelName, sessionKey strin
 	path, ok := s.pathFor(modelName, sessionKey)
 	if !ok {
 		return fmt.Errorf("antigravity replay disk delete: empty model or session key")
+	}
+	info, errRoot := os.Lstat(s.dir)
+	if os.IsNotExist(errRoot) {
+		return nil
+	}
+	if errRoot != nil {
+		return fmt.Errorf("antigravity replay disk delete: stat cache root: %w", errRoot)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("antigravity replay disk delete: unsafe cache root %s", s.dir)
 	}
 	if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {
 		return fmt.Errorf("antigravity replay disk delete: %w", errRemove)
