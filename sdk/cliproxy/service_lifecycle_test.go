@@ -120,3 +120,193 @@ func TestReplayCacheHomeConfigDisablesDiskRoot(t *testing.T) {
 		t.Fatalf("Home mode wrote replay state into the auth dir: %v", authEntries)
 	}
 }
+
+func TestReplayCacheConfigResolvesRelativeAuthDirAbsolute(t *testing.T) {
+	isolateGlobalHomeClient(t)
+	cache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(func() {
+		cache.ClearAntigravityReasoningReplayCache()
+		cache.SetAntigravityReasoningReplayCacheRoot("")
+	})
+
+	baseDir := t.TempDir()
+	t.Chdir(baseDir)
+
+	cfg := &config.Config{
+		AuthDir: "rel-auth-dir",
+		Host:    "127.0.0.1",
+		Port:    0,
+	}
+	service := newReplayCacheServiceForTest(t, cfg)
+
+	// Startup sequence Run performs: resolve one absolute AuthDir, create it,
+	// then wire the replay cache from the same resolved value.
+	if errEnsure := service.ensureAuthDir(); errEnsure != nil {
+		t.Fatalf("ensureAuthDir() error = %v", errEnsure)
+	}
+	service.configureAntigravityReplayCache(cfg)
+
+	if !filepath.IsAbs(cfg.AuthDir) {
+		t.Fatalf("AuthDir %q left relative after resolution", cfg.AuthDir)
+	}
+	wantRoot := filepath.Join(cfg.AuthDir, "antigravity-replay")
+
+	// Moving the process CWD away must not relocate the replay root.
+	otherDir := t.TempDir()
+	t.Chdir(otherDir)
+
+	const model, session = "gemini-3.6-flash-high", "relative-auth-session"
+	item := []byte(`{"type":"thought_signature","thoughtSignature":"relative-auth-signature-1234567890"}`)
+	if !cache.CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("replay cache write failed")
+	}
+
+	entries, errReadDir := os.ReadDir(wantRoot)
+	if errReadDir != nil {
+		t.Fatalf("replay root %s missing after write: %v", wantRoot, errReadDir)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("replay root has %d entries, want 1", len(entries))
+	}
+	if _, errStat := os.Lstat(filepath.Join(otherDir, "rel-auth-dir")); !os.IsNotExist(errStat) {
+		t.Fatalf("relative auth dir resolved through the process CWD: %v", errStat)
+	}
+}
+
+func TestReplayCacheConfigResolvesTildeAuthDir(t *testing.T) {
+	isolateGlobalHomeClient(t)
+	cache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(func() {
+		cache.ClearAntigravityReasoningReplayCache()
+		cache.SetAntigravityReasoningReplayCacheRoot("")
+	})
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	cfg := &config.Config{
+		AuthDir: "~/tilde-auth-dir",
+		Host:    "127.0.0.1",
+		Port:    0,
+	}
+	service := newReplayCacheServiceForTest(t, cfg)
+
+	if errEnsure := service.ensureAuthDir(); errEnsure != nil {
+		t.Fatalf("ensureAuthDir() error = %v", errEnsure)
+	}
+	service.configureAntigravityReplayCache(cfg)
+
+	wantAuthDir := filepath.Join(homeDir, "tilde-auth-dir")
+	if cfg.AuthDir != wantAuthDir {
+		t.Fatalf("AuthDir = %q, want %q", cfg.AuthDir, wantAuthDir)
+	}
+	const model, session = "gemini-3.6-flash-high", "tilde-auth-session"
+	item := []byte(`{"type":"thought_signature","thoughtSignature":"tilde-auth-signature-1234567890"}`)
+	if !cache.CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("replay cache write failed")
+	}
+	entries, errReadDir := os.ReadDir(filepath.Join(wantAuthDir, "antigravity-replay"))
+	if errReadDir != nil {
+		t.Fatalf("replay root missing under tilde-resolved auth dir: %v", errReadDir)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("replay root has %d entries, want 1", len(entries))
+	}
+}
+
+func TestReplayCacheConfigUpdateRewiresRoot(t *testing.T) {
+	isolateGlobalHomeClient(t)
+	cache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(func() {
+		cache.ClearAntigravityReasoningReplayCache()
+		cache.SetAntigravityReasoningReplayCacheRoot("")
+	})
+
+	baseDir := t.TempDir()
+	t.Chdir(baseDir)
+
+	startupCfg := &config.Config{
+		AuthDir: "startup-auth-dir",
+		Host:    "127.0.0.1",
+		Port:    0,
+	}
+	service := newReplayCacheServiceForTest(t, startupCfg)
+	if errEnsure := service.ensureAuthDir(); errEnsure != nil {
+		t.Fatalf("ensureAuthDir() error = %v", errEnsure)
+	}
+	service.configureAntigravityReplayCache(startupCfg)
+	oldRoot := filepath.Join(startupCfg.AuthDir, "antigravity-replay")
+
+	// Watcher-style runtime update points at a different relative auth dir.
+	updatedCfg := &config.Config{
+		AuthDir: "updated-auth-dir",
+		Host:    "127.0.0.1",
+		Port:    0,
+	}
+	service.applyWatcherConfigUpdate(updatedCfg)
+	newRoot := filepath.Join(baseDir, "updated-auth-dir", "antigravity-replay")
+
+	// The rewired root must stay anchored to the resolved dir when CWD moves.
+	otherDir := t.TempDir()
+	t.Chdir(otherDir)
+
+	const model, session = "gemini-3.6-flash-high", "update-rewire-session"
+	item := []byte(`{"type":"thought_signature","thoughtSignature":"update-rewire-signature-1234567890"}`)
+	if !cache.CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("replay cache write failed")
+	}
+
+	entries, errReadDir := os.ReadDir(newRoot)
+	if errReadDir != nil {
+		t.Fatalf("replay root not rewired after config update: %v", errReadDir)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("replay root has %d entries, want 1", len(entries))
+	}
+	if _, errStat := os.Lstat(oldRoot); !os.IsNotExist(errStat) {
+		t.Fatalf("stale replay root still active after config update: %v", errStat)
+	}
+	if _, errStat := os.Lstat(filepath.Join(otherDir, "updated-auth-dir")); !os.IsNotExist(errStat) {
+		t.Fatalf("updated auth dir resolved through the process CWD: %v", errStat)
+	}
+}
+
+func TestReplayCacheConfigUpdateHomeDisablesRoot(t *testing.T) {
+	isolateGlobalHomeClient(t)
+	cache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(func() {
+		cache.ClearAntigravityReasoningReplayCache()
+		cache.SetAntigravityReasoningReplayCacheRoot("")
+	})
+
+	authDir := t.TempDir()
+	startupCfg := &config.Config{
+		AuthDir: authDir,
+		Host:    "127.0.0.1",
+		Port:    0,
+	}
+	service := newReplayCacheServiceForTest(t, startupCfg)
+	if errEnsure := service.ensureAuthDir(); errEnsure != nil {
+		t.Fatalf("ensureAuthDir() error = %v", errEnsure)
+	}
+	service.configureAntigravityReplayCache(startupCfg)
+	oldRoot := filepath.Join(authDir, "antigravity-replay")
+
+	// Runtime update switches the service into Home mode.
+	service.applyWatcherConfigUpdate(&config.Config{
+		AuthDir: authDir,
+		Host:    "127.0.0.1",
+		Port:    0,
+		Home:    internalconfig.HomeConfig{Enabled: true},
+	})
+
+	const model, session = "gemini-3.6-flash-high", "update-home-session"
+	item := []byte(`{"type":"thought_signature","thoughtSignature":"update-home-signature-1234567890"}`)
+	if !cache.CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("replay cache write failed")
+	}
+
+	if _, errStat := os.Lstat(oldRoot); !os.IsNotExist(errStat) {
+		t.Fatalf("Home mode update left local replay persistence active: %v", errStat)
+	}
+}

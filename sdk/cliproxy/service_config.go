@@ -129,6 +129,11 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 
+	// Re-wire the replay cache root on every accepted runtime configuration
+	// (watcher reloads and Home payloads). Home mode and unresolvable auth
+	// directories disable local persistence.
+	s.configureAntigravityReplayCache(cfg)
+
 	if !s.applyManagerConfig(ctx, commit) {
 		return false
 	}
