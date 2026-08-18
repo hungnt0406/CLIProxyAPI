@@ -180,17 +180,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 	s.syncPluginModelRuntime(registrationCtx)
-	if errContext := ctx.Err(); errContext != nil {
-		return false
-	}
-
-	// The runtime update fully succeeded (manager, pprof, server clients,
-	// plugins, and executors are consistent). Only now move the
-	// process-global replay root so a failed or cancelled update can never
-	// leave it ahead of the runtime behavior that is actually in effect.
-	// Home mode and unresolvable auth directories disable local persistence.
-	s.configureAntigravityReplayCache(cfg)
-	return true
+	return ctx.Err() == nil
 }
 
 func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) bool {

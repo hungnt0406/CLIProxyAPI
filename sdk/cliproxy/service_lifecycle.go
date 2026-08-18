@@ -5,15 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -73,7 +70,6 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
-	s.configureAntigravityReplayCache(s.cfg)
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
 
@@ -354,95 +350,20 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	return shutdownErr
 }
 
-// resolveAuthDirAbsolute resolves cfg.AuthDir to one canonical absolute path
-// shared by auth-dir creation and replay-cache wiring.
-//
-// [WHY]
-// A relative `auth-dir` value would make both the auth directory and the
-// replay root resolve through the process working directory, silently moving
-// state when the CWD changes; every consumer must agree on one absolute path.
-//
-// [HOW]
-// 1. Apply tilde expansion and the default directory via util.ResolveAuthDir.
-// 2. Anchor the result against the current working directory.
-//
-// [RULES / NOTES]
-//   - An empty AuthDir falls back to the default directory and stays absolute.
-//   - Never returns the raw YAML value; callers failing here must not create
-//     or persist anything under a guessed path.
-//
-// @param cfg the active service configuration.
-// @return the absolute auth directory, or an error when it cannot be resolved.
-func resolveAuthDirAbsolute(cfg *config.Config) (string, error) {
-	if cfg == nil {
-		return "", nil
-	}
-	resolved, errResolve := util.ResolveAuthDir(cfg.AuthDir)
-	if errResolve != nil {
-		return "", errResolve
-	}
-	return filepath.Abs(resolved)
-}
-
-// configureAntigravityReplayCache wires standalone replay persistence to the
-// resolved authentication directory, or disables local persistence for Home
-// mode.
-//
-// [WHY]
-// Standalone deployments have no Home KV store; replay provenance must survive
-// restarts under the resolved AuthDir, while Home mode must keep replay state
-// in Home KV and never touch the local disk.
-//
-// [HOW]
-//  1. Disable the local root when the configuration is nil or Home is enabled.
-//  2. Resolve AuthDir to one absolute path (tilde expansion, default, and
-//     CWD anchoring applied), never the raw `auth-dir` YAML value.
-//  3. Point the replay cache at `<AuthDir>/antigravity-replay`.
-//  4. Fall back to an empty root when resolution fails, keeping the cache
-//     in-memory only.
-//
-// [RULES / NOTES]
-//   - An empty root restores the original in-memory-only behavior.
-//   - Called from Run after AuthDir is resolved and before request handling,
-//     and from applyConfigRuntime only after a runtime update fully succeeds,
-//     so a failed update never moves the root ahead of live runtime behavior.
-//
-// @param cfg the active service configuration.
-func (s *Service) configureAntigravityReplayCache(cfg *config.Config) {
-	if cfg == nil || cfg.Home.Enabled {
-		cache.SetAntigravityReasoningReplayCacheRoot("")
-		return
-	}
-	authDir, errResolve := resolveAuthDirAbsolute(cfg)
-	if errResolve != nil {
-		log.Warnf("failed to resolve auth directory for antigravity replay cache: %v", errResolve)
-		cache.SetAntigravityReasoningReplayCacheRoot("")
-		return
-	}
-	cache.SetAntigravityReasoningReplayCacheRoot(filepath.Join(authDir, "antigravity-replay"))
-}
-
 func (s *Service) ensureAuthDir() error {
-	authDir, errResolve := resolveAuthDirAbsolute(s.cfg)
-	if errResolve != nil {
-		return fmt.Errorf("cliproxy: failed to resolve auth directory: %w", errResolve)
-	}
-	// Write the resolved absolute path back so auth-dir creation, the replay
-	// cache root, and every later consumer agree on the same directory.
-	s.cfg.AuthDir = authDir
-	info, err := os.Stat(authDir)
+	info, err := os.Stat(s.cfg.AuthDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if mkErr := os.MkdirAll(authDir, 0o755); mkErr != nil {
-				return fmt.Errorf("cliproxy: failed to create auth directory %s: %w", authDir, mkErr)
+			if mkErr := os.MkdirAll(s.cfg.AuthDir, 0o755); mkErr != nil {
+				return fmt.Errorf("cliproxy: failed to create auth directory %s: %w", s.cfg.AuthDir, mkErr)
 			}
-			log.Infof("created missing auth directory: %s", authDir)
+			log.Infof("created missing auth directory: %s", s.cfg.AuthDir)
 			return nil
 		}
-		return fmt.Errorf("cliproxy: error checking auth directory %s: %w", authDir, err)
+		return fmt.Errorf("cliproxy: error checking auth directory %s: %w", s.cfg.AuthDir, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("cliproxy: auth path exists but is not a directory: %s", authDir)
+		return fmt.Errorf("cliproxy: auth path exists but is not a directory: %s", s.cfg.AuthDir)
 	}
 	return nil
 }

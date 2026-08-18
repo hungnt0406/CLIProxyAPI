@@ -128,46 +128,6 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
-## Operational Notes: Antigravity Replay Persistence
-
-Standalone deployments persist private Antigravity reasoning-replay metadata
-on local disk so resumed OpenCode conversations survive proxy restarts:
-
-- **Location.** Replay metadata is stored under the resolved `auth-dir`
-  (default `~/.cli-proxy-api`) in the `antigravity-replay` subdirectory,
-  created lazily on the first write. Files contain only normalized replay
-  items (thought signatures and function-call parts) and cache-fencing
-  fields. Original requests, responses, auth files, and conversation
-  transcripts are never serialized; because function-call arguments are
-  stored in normalized form, application-supplied tool arguments may
-  contain sensitive data.
-- **Permissions.** The directory is created with `0700` and files with `0600`
-  (owner-only). Cache files that expose group/other access are rejected as
-  cache misses.
-- **Retention.** In-memory entries expire one hour after their last access
-  and are refreshed on every read, so an actively used conversation stays
-  valid while the process runs. Persisted files keep the timestamp of their
-  last write and are rejected — and removed best-effort — when loaded more
-  than one hour old. Periodic cleanup (every 10 minutes) expires resident
-  entries and removes their files; files for memory-evicted entries may
-  remain until a later load rejects and removes them, or the directory is
-  cleared manually.
-- **Clearing and restart recovery.** Stop CLIProxyAPI and remove the
-  directory: `rm -rf <auth-dir>/antigravity-replay`. The cache holds no
-  conversation history, so it is safe to delete at any time; only replay
-  continuity for in-flight conversations is lost. Entries not yet expired
-  (persisted no more than one hour ago) are reloaded from disk on first access
-  after a restart.
-- **Home mode.** When Home mode is active, its KV store remains authoritative
-  and the local directory is not used.
-- **Runtime `auth-dir` changes.** The replay root follows the resolved
-  `auth-dir` at startup and when an accepted configuration update changes it.
-  Files written under a previous root are not migrated and may be removed
-  manually.
-- **Fail-closed.** Missing, expired, corrupt, or otherwise invalid replay
-  provenance fails closed with the existing error; disk state can never make
-  unknown provenance valid.
-
 ## Usage Statistics
 
 Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) no longer ship built-in usage statistics. If you need usage statistics, use:
