@@ -137,19 +137,27 @@ on local disk so resumed OpenCode conversations survive proxy restarts:
   (default `~/.cli-proxy-api`) in the `antigravity-replay` subdirectory,
   created lazily on the first write. Files contain only normalized replay
   items (thought signatures and function-call parts) and cache-fencing
-  fields — never original requests, responses, credentials, or conversation
-  transcripts.
+  fields. Original requests, responses, auth files, and conversation
+  transcripts are never serialized; because function-call arguments are
+  stored in normalized form, application-supplied tool arguments may
+  contain sensitive data.
 - **Permissions.** The directory is created with `0700` and files with `0600`
   (owner-only). Cache files that expose group/other access are rejected as
   cache misses.
-- **Retention.** Entries are considered expired one hour after their last
-  write; expired entries are dropped from memory and removed from disk by
-  periodic cleanup (every 10 minutes) and whenever they are accessed.
+- **Retention.** In-memory entries expire one hour after their last access
+  and are refreshed on every read, so an actively used conversation stays
+  valid while the process runs. Persisted files keep the timestamp of their
+  last write and are rejected — and removed best-effort — when loaded more
+  than one hour old. Periodic cleanup (every 10 minutes) expires resident
+  entries and removes their files; files for memory-evicted entries may
+  remain until a later load rejects and removes them, or the directory is
+  cleared manually.
 - **Clearing and restart recovery.** Stop CLIProxyAPI and remove the
   directory: `rm -rf <auth-dir>/antigravity-replay`. The cache holds no
   conversation history, so it is safe to delete at any time; only replay
-  continuity for in-flight conversations is lost. Valid (unexpired) entries
-  are reloaded from disk on first access after a restart.
+  continuity for in-flight conversations is lost. Entries not yet expired
+  (persisted less than one hour ago) are reloaded from disk on first access
+  after a restart.
 - **Home mode.** When Home mode is active, its KV store remains authoritative
   and the local directory is not used.
 - **Runtime `auth-dir` changes.** The replay root follows the resolved

@@ -2,7 +2,11 @@
 
 - **Date:** 2026-08-18
 - **Status:** Decided during Task 4 of the local replay cache plan
-  (`docs/superpowers/plans/2026-08-18-antigravity-local-replay-cache.md`)
+  (`docs/superpowers/plans/2026-08-18-antigravity-local-replay-cache.md`).
+  Revised after review round 1 (same day): retention stated per layer
+  (memory refresh vs. file write timestamp), the contents claim scoped to
+  normalized function-call arguments, and cleanup wording made
+  eviction-aware.
 
 ## Decision
 
@@ -14,12 +18,19 @@ framework is introduced). The documented contract:
 
 1. **Contents** — only normalized replay items (thought signatures and
    function-call parts) plus timestamp/revision/branch/deleted fencing
-   fields. Never original requests, responses, credentials, or transcripts.
+   fields. Original requests, responses, auth files, and conversation
+   transcripts are never serialized; normalized function-call arguments
+   may contain application-supplied sensitive data.
 2. **Permissions** — directory `0700`, files `0600` (owner-only); files with
    group/other access bits are rejected as cache misses.
-3. **Retention** — entries are considered expired one hour after their last
-   write; expired entries are dropped from memory and removed from disk by
-   periodic cleanup (10-minute interval) and on access.
+3. **Retention** — in-memory entries expire one hour after their last
+   access and are refreshed on every read, so an actively used conversation
+   stays valid while the process runs. Persisted files keep the timestamp
+   of their last write and are rejected (and removed best-effort) when
+   loaded more than one hour old. Periodic cleanup (10-minute interval)
+   expires resident entries and removes their files; files for
+   memory-evicted entries may remain until a later load rejects and removes
+   them, or the directory is cleared manually.
 4. **Clearing and restart recovery** — operators stop CLIProxyAPI and run
    `rm -rf <AuthDir>/antigravity-replay`; after a restart, valid entries are
    hydrated from disk on the first read miss. The directory holds no
@@ -60,10 +71,14 @@ the plan forbids introducing a documentation-test framework.
     verification is a documented command sequence plus `go test ./...`.
   - **Adding a doc-lint/golden-file test** — rejected: explicitly forbidden by
     the plan and not the repo's convention.
-- **Retention phrasing** — "one hour after the last write" (chosen) rather
-  than "last access": disk files are rewritten only on mutations, reads
-  refresh the in-memory timestamp but never the persisted file, so the
-  persisted TTL is bounded by the last write.
+- **Retention phrasing** — the contract states each layer's lifetime
+  separately, after review: memory entries expire one hour after their last
+  access refresh (reads touch memory only), while persisted files keep
+  their write timestamp and are rejected when loaded more than one hour
+  old. A strict "one hour after the last write" for the combined entry
+  would be wrong — an actively used conversation is refreshed in memory —
+  and "one hour after last access" would be wrong for the file, which reads
+  never rewrite.
 
 ## Reasoning
 
@@ -79,6 +94,17 @@ the plan forbids introducing a documentation-test framework.
   `ClearAntigravityReasoningReplayCache` semantics and the spec's
   "Operational Impact" section; the decision record from Task 2 already
   committed to documenting exactly this command.
+- Retention is stated per layer because the implementation enforces
+  different timestamps for memory and disk: reads refresh the in-memory
+  timestamp (`entry.Timestamp = now` on hit and on hydration) but never
+  rewrite the file, whose timestamp is fixed at save time; cleanup is
+  best-effort for evicted keys, so the docs say only what the code
+  guarantees.
+- The contents claim is deliberately scoped: the disk file shape carries
+  only normalized items and fencing fields, but `function_call_part` items
+  store `name` and `args` verbatim, so application-supplied tool arguments
+  can be sensitive; "never serialized" applies to original requests,
+  responses, auth files, and transcripts only.
 - Documenting "fail-closed" matters operationally: it reassures operators
   that deleting or corrupting these files degrades to the pre-existing
   error, never to accepting unknown provenance.
@@ -96,7 +122,7 @@ the plan forbids introducing a documentation-test framework.
 
 ## Next steps
 
-- Run `gofmt -l`/`gofmt -w` on the tree (no Go files change in this task),
-  run `go test ./...`, self-review both documents against the implementation,
-  and commit:
-  `git add README.md && git add -f docs/superpowers/decisions/2026-08-18-local-replay-cache-storage.md && git commit -m "docs: document local antigravity replay persistence"`.
+- Review round 1 corrections committed as `docs: correct replay cache
+  persistence wording` on top of the initial `docs: document local
+  antigravity replay persistence` commit; verification is `gofmt -l` and
+  `go test ./...`.
