@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -1481,6 +1482,34 @@ func TestPrepareAntigravityGeminiReasoningReplayFailsClosedWithoutClaudeToolProv
 	_, _, errPrepare := prepareAntigravityGeminiReasoningReplayPayload(context.Background(), model, cliproxyexecutor.Request{Model: model, Payload: payload}, opts, payload)
 	if errPrepare == nil || !strings.Contains(errPrepare.Error(), "missing Claude tool provenance") {
 		t.Fatalf("error = %v, want fail-closed missing provenance", errPrepare)
+	}
+}
+
+func TestPrepareAntigravityGeminiReasoningReplayFailsClosedForUnknownClaudeToolWithDiskRoot(t *testing.T) {
+	internalcache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(internalcache.ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	internalcache.SetAntigravityReasoningReplayCacheRoot(root)
+	t.Cleanup(func() { internalcache.SetAntigravityReasoningReplayCacheRoot("") })
+
+	const model = "gemini-3.6-flash-high"
+	// Persist real provenance for an unrelated session so the disk store is
+	// demonstrably active while the unknown tool ID below still fails closed.
+	knownItem := []byte(`{"type":"function_call_part","contentIndex":0,"partIndex":0,"targetOccurrence":0,"name":"Read","call_id":"native-known","args":{"file_path":"/tmp/other"},"thoughtSignature":"EsMTCsATARFNMg/XNVix5lDpkKaHR7Xg"}`)
+	if !internalcache.CacheAntigravityReasoningReplayItems(model, "session:disk-other", [][]byte{knownItem}) {
+		t.Fatal("failed to cache known provenance")
+	}
+	if entries, errList := os.ReadDir(root); errList != nil || len(entries) == 0 {
+		t.Fatalf("disk persistence inactive: %d files, err %v", len(entries), errList)
+	}
+
+	clientID := util.GeminiClaudeToolUseID("native-unknown", "Read", `{"file_path":"/tmp/a"}`)
+	payload := []byte(`{"sessionId":"sess-disk-unknown","request":{"contents":[{"role":"model","parts":[{"thoughtSignature":"skip_thought_signature_validator","functionCall":{"id":"` + clientID + `","name":"Read","args":{"file_path":"/tmp/a"}}}]},{"role":"user","parts":[{"functionResponse":{"id":"` + clientID + `","name":"Read","response":{"result":"ok"}}}]}]}}`)
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	_, _, errPrepare := prepareAntigravityGeminiReasoningReplayPayload(context.Background(), model, cliproxyexecutor.Request{Model: model, Payload: payload}, opts, payload)
+	if errPrepare == nil || !strings.Contains(errPrepare.Error(), "missing Claude tool provenance") {
+		t.Fatalf("error = %v, want fail-closed missing provenance with disk root active", errPrepare)
 	}
 }
 

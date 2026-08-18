@@ -70,6 +70,12 @@ var (
 	antigravityReasoningReplayEntries       = make(map[string]antigravityReasoningReplayEntry)
 	antigravityReasoningReplayNextRevision  uint64
 	antigravityReasoningReplayEvictionEpoch uint64
+
+	// antigravityReasoningReplayDiskRoot is the private cache directory for
+	// standalone replay persistence. An empty root keeps the cache in-memory
+	// only, preserving the pre-disk behavior for every mode until the service
+	// explicitly configures a root.
+	antigravityReasoningReplayDiskRoot string
 )
 
 type antigravityReasoningReplayKVClient interface {
@@ -81,6 +87,166 @@ type antigravityReasoningReplayKVClient interface {
 
 var currentAntigravityReasoningReplayKVClient = func() (antigravityReasoningReplayKVClient, bool, error) {
 	return homekv.CurrentKVClient()
+}
+
+// SetAntigravityReasoningReplayCacheRoot configures the private directory used
+// to persist standalone replay state across process restarts.
+//
+// [WHY]
+// Standalone deployments have no Home KV store; a local cache root under the
+// resolved authentication directory gives them restart continuity without
+// changing the public cache API.
+//
+// [HOW]
+// 1. Trim the supplied directory.
+// 2. Store it under the cache lock; an empty value disables disk persistence.
+//
+// [RULES / NOTES]
+// - Passing an empty root restores the original in-memory-only behavior.
+// - The root must be absolute and private; callers derive it from AuthDir.
+//
+// @param dir absolute cache root (expected `<AuthDir>/antigravity-replay`).
+func SetAntigravityReasoningReplayCacheRoot(dir string) {
+	antigravityReasoningReplayMu.Lock()
+	defer antigravityReasoningReplayMu.Unlock()
+	antigravityReasoningReplayDiskRoot = strings.TrimSpace(dir)
+}
+
+// antigravityReasoningReplayDiskStoreFor returns the active disk store for
+// standalone persistence, or nil when no cache root is configured.
+//
+// [WHY]
+// All persistence hooks must silently no-op unless the service configured a
+// private root, preserving Home mode and the original in-memory behavior.
+//
+// [HOW]
+// 1. Reject an empty configured root.
+// 2. Bind a store to the configured root directory.
+//
+// @return the disk store, or nil when persistence is disabled.
+func antigravityReasoningReplayDiskStoreFor() *antigravityReasoningReplayDiskStore {
+	if antigravityReasoningReplayDiskRoot == "" {
+		return nil
+	}
+	return newAntigravityReasoningReplayDiskStore(antigravityReasoningReplayDiskRoot)
+}
+
+// antigravityReasoningReplayMirrorLocked persists one successful standalone
+// mutation after the in-memory map was updated. antigravityReasoningReplayMu
+// must be held by the caller.
+//
+// [WHY]
+// Restart survival requires every accepted mutation to reach disk; a failed
+// write must never fail the request, only leave a stale file behind.
+//
+// [HOW]
+// 1. Skip when no disk store is configured.
+// 2. Save the entry; log best-effort failures at debug level.
+//
+// [RULES / NOTES]
+// - The entry was already normalized and limit-checked by the caller.
+// - A failed save keeps the in-memory mutation authoritative.
+//
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @param entry the mutated entry to persist.
+func antigravityReasoningReplayMirrorLocked(modelName, sessionKey string, entry antigravityReasoningReplayEntry) {
+	store := antigravityReasoningReplayDiskStoreFor()
+	if store == nil {
+		return
+	}
+	if errSave := store.save(modelName, sessionKey, entry); errSave != nil {
+		log.Debugf("antigravity replay disk: mirror standalone write failed: %v", errSave)
+	}
+}
+
+// antigravityReasoningReplayHydrateFromDiskLocked loads one persisted entry
+// when the in-memory map lacks the key, populating the map so the normal read
+// path and later mutations fence against the restored revision and branch.
+// antigravityReasoningReplayMu must be held by the caller.
+//
+// [WHY]
+// After a process restart only the disk holds replay state; hydration must
+// reproduce the exact pre-restart entry, revision, and branch semantics.
+//
+// [HOW]
+// 1. Skip when no disk store is configured.
+// 2. Load the entry; every disk rejection is a miss.
+// 3. Refresh the timestamp, insert the entry, and bound the map.
+//
+// [RULES / NOTES]
+// - The disk store validates TTL, permissions, and limits before returning.
+// - A miss must not fabricate provenance; callers reserve absence as usual.
+//
+// @param key the in-memory map key derived from the model/session pair.
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @param now the reference time for TTL refresh.
+// @return the hydrated entry and true on success, otherwise the zero entry and false.
+func antigravityReasoningReplayHydrateFromDiskLocked(key, modelName, sessionKey string, now time.Time) (antigravityReasoningReplayEntry, bool) {
+	store := antigravityReasoningReplayDiskStoreFor()
+	if store == nil {
+		return antigravityReasoningReplayEntry{}, false
+	}
+	entry, found := store.load(modelName, sessionKey, now)
+	if !found {
+		return antigravityReasoningReplayEntry{}, false
+	}
+	entry.Timestamp = now
+	antigravityReasoningReplayEntries[key] = entry
+	if len(antigravityReasoningReplayEntries) > AntigravityReasoningReplayCacheMaxEntries {
+		evictOldestAntigravityReasoningReplayEntries(AntigravityReasoningReplayCacheEvictBatchSize)
+	}
+	return entry, true
+}
+
+// antigravityReasoningReplayDiskDeleteLocked removes the persisted file for
+// one model/session key. antigravityReasoningReplayMu must be held by the
+// caller.
+//
+// [WHY]
+// Deletion and expiry must clear durable state so a restart cannot resurrect
+// a cleared conversation or an expired chain.
+//
+// [HOW]
+// 1. Skip when no disk store is configured.
+// 2. Delete the file; log best-effort failures at debug level.
+//
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+func antigravityReasoningReplayDiskDeleteLocked(modelName, sessionKey string) {
+	store := antigravityReasoningReplayDiskStoreFor()
+	if store == nil {
+		return
+	}
+	if errDelete := store.delete(modelName, sessionKey); errDelete != nil {
+		log.Debugf("antigravity replay disk: delete standalone entry failed: %v", errDelete)
+	}
+}
+
+// antigravityReasoningReplayDiskDeleteKeyLocked removes the persisted file
+// for an expired in-memory key by parsing the model/session pair back out of
+// the cache key. antigravityReasoningReplayMu must be held by the caller.
+//
+// [WHY]
+// Background expiry cleanup iterates the map by key only; the persisted file
+// is at least as old as the expired memory entry and must not linger.
+//
+// [HOW]
+// 1. Split the key on the NUL separators used by the key derivation.
+// 2. Delete the file for the recovered model/session pair.
+//
+// [RULES / NOTES]
+//   - Keys that do not round-trip (pathological embedded NULs) skip removal;
+//     their memory entry is still purged and a later load rejects the file.
+//
+// @param key the in-memory map key of the expired entry.
+func antigravityReasoningReplayDiskDeleteKeyLocked(key string) {
+	parts := strings.SplitN(key, "\x00", 3)
+	if len(parts) != 3 || parts[0] != "antigravity-reasoning-replay" {
+		return
+	}
+	antigravityReasoningReplayDiskDeleteLocked(parts[1], parts[2])
 }
 
 // CacheAntigravityReasoningReplayItem stores a final GPT/Codex reasoning item for
@@ -96,7 +262,27 @@ func CacheAntigravityReasoningReplayItems(modelName, sessionKey string, items []
 	return CacheAntigravityReasoningReplayItemsBestEffort(context.Background(), modelName, sessionKey, items)
 }
 
-// CacheAntigravityReasoningReplayItemsBestEffort stores replay items for completed response paths.
+// CacheAntigravityReasoningReplayItemsBestEffort stores replay items for
+// completed response paths.
+//
+// [WHY]
+// A finished response chain must survive a restart so the next turn can replay
+// it; standalone mode additionally mirrors the accepted entry to disk.
+//
+// [HOW]
+// 1. Reject blank keys and unnormalizable item chains.
+// 2. Prefer Home KV when the Home client is active.
+// 3. Otherwise write the normalized entry to the in-memory map.
+// 4. Mirror the successful mutation to the configured disk store.
+//
+// [RULES / NOTES]
+// - A failed disk mirror never fails the write; memory stays authoritative.
+//
+// @param ctx the caller context for Home KV operations.
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @param items the raw reasoning items to normalize and store.
+// @return true when the items were cached.
 func CacheAntigravityReasoningReplayItemsBestEffort(ctx context.Context, modelName, sessionKey string, items [][]byte) bool {
 	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
 	if key == "" {
@@ -129,15 +315,17 @@ func CacheAntigravityReasoningReplayItemsBestEffort(ctx context.Context, modelNa
 	antigravityReasoningReplayMu.Lock()
 	defer antigravityReasoningReplayMu.Unlock()
 	antigravityReasoningReplayNextRevision++
-	antigravityReasoningReplayEntries[key] = antigravityReasoningReplayEntry{
+	entry := antigravityReasoningReplayEntry{
 		Items:     normalized,
 		Timestamp: now,
 		Revision:  antigravityReasoningReplayNextRevision,
 		Branch:    newAntigravityReasoningReplayGeneration(),
 	}
+	antigravityReasoningReplayEntries[key] = entry
 	if len(antigravityReasoningReplayEntries) > AntigravityReasoningReplayCacheMaxEntries {
 		evictOldestAntigravityReasoningReplayEntries(AntigravityReasoningReplayCacheEvictBatchSize)
 	}
+	antigravityReasoningReplayMirrorLocked(modelName, sessionKey, entry)
 	return true
 }
 
@@ -167,6 +355,26 @@ func GetAntigravityReasoningReplayItemsRequired(ctx context.Context, modelName, 
 
 // GetAntigravityReasoningReplayItemsWithSnapshotRequired retrieves replay items
 // and the exact cache state that guarded this request.
+//
+// [WHY]
+// Request-time paths need both the items and the fencing snapshot so a later
+// conditional mutation can prove it still owns the state; standalone reads
+// hydrate from disk only when memory lost the key.
+//
+// [HOW]
+// 1. Prefer Home KV when the Home client is active.
+// 2. Serve from the in-memory map, refreshing the entry TTL.
+// 3. On a memory miss, hydrate the key from the configured disk store.
+// 4. On expiry, remove memory and persisted state and reserve absence.
+//
+// [RULES / NOTES]
+// - Disk load failures are misses; they never fabricate provenance.
+// - Hydration preserves the persisted revision and branch for fencing.
+//
+// @param ctx the caller context for Home KV operations.
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @return the normalized items, the guarding snapshot, whether state was found, and an error.
 func GetAntigravityReasoningReplayItemsWithSnapshotRequired(ctx context.Context, modelName, sessionKey string) ([][]byte, AntigravityReasoningReplaySnapshot, bool, error) {
 	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
 	if key == "" {
@@ -233,11 +441,15 @@ func GetAntigravityReasoningReplayItemsWithSnapshotRequired(ctx context.Context,
 	defer antigravityReasoningReplayMu.Unlock()
 	entry, ok := antigravityReasoningReplayEntries[key]
 	if !ok {
+		entry, ok = antigravityReasoningReplayHydrateFromDiskLocked(key, modelName, sessionKey, now)
+	}
+	if !ok {
 		return nil, reserveAntigravityReasoningReplayAbsentLocked(key, now), false, nil
 	}
 	if now.Sub(entry.Timestamp) > AntigravityReasoningReplayCacheTTL {
 		antigravityReasoningReplayEvictionEpoch++
 		delete(antigravityReasoningReplayEntries, key)
+		antigravityReasoningReplayDiskDeleteLocked(modelName, sessionKey)
 		return nil, reserveAntigravityReasoningReplayAbsentLocked(key, now), false, nil
 	}
 	entry.Timestamp = now
@@ -276,6 +488,26 @@ func reserveAntigravityReasoningReplayAbsentLocked(key string, now time.Time) An
 
 // ReplaceAntigravityReasoningReplayItemsIfUnchanged publishes a completed chain
 // only when no newer request has changed the state read by this request.
+//
+// [WHY]
+// Concurrent turns must never overwrite newer state with a stale chain;
+// standalone accepted replacements are mirrored to disk for restart survival.
+//
+// [HOW]
+// 1. Validate and normalize the replacement items.
+// 2. Prefer Home KV compare-and-swap when the Home client is active.
+// 3. Fence the standalone write against the snapshot revision and branch.
+// 4. On success, replace the memory entry and mirror it to disk.
+//
+// [RULES / NOTES]
+// - A failed disk mirror never fails the write; memory stays authoritative.
+//
+// @param ctx the caller context for Home KV operations.
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @param snapshot the state guard captured when this chain was read.
+// @param items the raw reasoning items to normalize and store.
+// @return true when the replacement was applied, and any error.
 func ReplaceAntigravityReasoningReplayItemsIfUnchanged(ctx context.Context, modelName, sessionKey string, snapshot AntigravityReasoningReplaySnapshot, items [][]byte) (bool, error) {
 	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
 	if key == "" {
@@ -345,15 +577,35 @@ func ReplaceAntigravityReasoningReplayItemsIfUnchanged(ctx context.Context, mode
 		branch = newAntigravityReasoningReplayGeneration()
 	}
 	antigravityReasoningReplayNextRevision++
-	antigravityReasoningReplayEntries[key] = antigravityReasoningReplayEntry{Items: normalized, Timestamp: now, Revision: antigravityReasoningReplayNextRevision, Branch: branch}
+	entry = antigravityReasoningReplayEntry{Items: normalized, Timestamp: now, Revision: antigravityReasoningReplayNextRevision, Branch: branch}
+	antigravityReasoningReplayEntries[key] = entry
 	if len(antigravityReasoningReplayEntries) > AntigravityReasoningReplayCacheMaxEntries {
 		evictOldestAntigravityReasoningReplayEntries(AntigravityReasoningReplayCacheEvictBatchSize)
 	}
+	antigravityReasoningReplayMirrorLocked(modelName, sessionKey, entry)
 	return true, nil
 }
 
 // DeleteAntigravityReasoningReplayItemsIfUnchanged clears replay state only when
 // it still matches the state read for this request.
+//
+// [WHY]
+// A stale request must never delete a newer chain; a successful standalone
+// delete also removes the persisted file so restart cannot resurrect it.
+//
+// [HOW]
+// 1. Prefer Home KV compare-and-swap when the Home client is active.
+// 2. Fence the standalone delete against the snapshot revision and epoch.
+// 3. On success, tombstone the memory entry and remove the disk file.
+//
+// [RULES / NOTES]
+// - The in-memory tombstone keeps in-process fencing; the disk file is removed.
+//
+// @param ctx the caller context for Home KV operations.
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @param snapshot the state guard captured when this chain was read.
+// @return true when the deletion was applied, and any error.
 func DeleteAntigravityReasoningReplayItemsIfUnchanged(ctx context.Context, modelName, sessionKey string, snapshot AntigravityReasoningReplaySnapshot) (bool, error) {
 	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
 	if key == "" {
@@ -381,6 +633,7 @@ func DeleteAntigravityReasoningReplayItemsIfUnchanged(ctx context.Context, model
 	if len(antigravityReasoningReplayEntries) > AntigravityReasoningReplayCacheMaxEntries {
 		evictOldestAntigravityReasoningReplayEntries(AntigravityReasoningReplayCacheEvictBatchSize)
 	}
+	antigravityReasoningReplayDiskDeleteLocked(modelName, sessionKey)
 	return true, nil
 }
 
@@ -392,7 +645,25 @@ func DeleteAntigravityReasoningReplayItem(modelName, sessionKey string) {
 	}
 }
 
-// DeleteAntigravityReasoningReplayItemRequired removes one replay item for request-time paths.
+// DeleteAntigravityReasoningReplayItemRequired removes one replay item for
+// request-time paths.
+//
+// [WHY]
+// Rejected or stale provenance must not be replayed; standalone deletion also
+// removes the persisted file so a restart cannot resurrect the entry.
+//
+// [HOW]
+// 1. Prefer a Home KV tombstone when the Home client is active.
+// 2. Tombstone the in-memory entry.
+// 3. Remove the persisted file best-effort.
+//
+// [RULES / NOTES]
+// - Disk removal failures are non-fatal and logged at debug level.
+//
+// @param ctx the caller context for Home KV operations.
+// @param modelName the upstream model name.
+// @param sessionKey the conversation continuity boundary.
+// @return any error from Home KV or the local tombstone write.
 func DeleteAntigravityReasoningReplayItemRequired(ctx context.Context, modelName, sessionKey string) error {
 	key := antigravityReasoningReplayCacheKey(modelName, sessionKey)
 	if key == "" {
@@ -413,6 +684,7 @@ func DeleteAntigravityReasoningReplayItemRequired(ctx context.Context, modelName
 	if len(antigravityReasoningReplayEntries) > AntigravityReasoningReplayCacheMaxEntries {
 		evictOldestAntigravityReasoningReplayEntries(AntigravityReasoningReplayCacheEvictBatchSize)
 	}
+	antigravityReasoningReplayDiskDeleteLocked(modelName, sessionKey)
 	antigravityReasoningReplayMu.Unlock()
 	return nil
 }
@@ -474,12 +746,30 @@ func newAntigravityReasoningReplayTombstone() []byte {
 	return raw
 }
 
-// ClearAntigravityReasoningReplayCache clears all Antigravity reasoning replay state.
+// ClearAntigravityReasoningReplayCache clears all Antigravity reasoning replay
+// state, including any persisted standalone files.
+//
+// [WHY]
+// Cache-wide resets must also discard durable state; operators rely on this
+// call (or removing the cache directory) to drop replay provenance.
+//
+// [HOW]
+// 1. Reset the in-memory map and bump the eviction epoch.
+// 2. Remove the whole disk store directory when one is configured.
+//
+// [RULES / NOTES]
+// - Directory removal failures are non-fatal and logged at debug level.
 func ClearAntigravityReasoningReplayCache() {
 	antigravityReasoningReplayMu.Lock()
 	antigravityReasoningReplayEntries = make(map[string]antigravityReasoningReplayEntry)
 	antigravityReasoningReplayEvictionEpoch++
+	store := antigravityReasoningReplayDiskStoreFor()
 	antigravityReasoningReplayMu.Unlock()
+	if store != nil {
+		if errClear := store.clear(); errClear != nil {
+			log.Debugf("antigravity replay disk: clear standalone persistence: %v", errClear)
+		}
+	}
 }
 
 func antigravityReasoningReplayCacheKey(modelName, sessionKey string) string {
@@ -650,6 +940,7 @@ func purgeExpiredAntigravityReasoningReplayCache(now time.Time) {
 		if now.Sub(entry.Timestamp) > AntigravityReasoningReplayCacheTTL {
 			antigravityReasoningReplayEvictionEpoch++
 			delete(antigravityReasoningReplayEntries, key)
+			antigravityReasoningReplayDiskDeleteKeyLocked(key)
 		}
 	}
 	antigravityReasoningReplayMu.Unlock()

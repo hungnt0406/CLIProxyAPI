@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -508,5 +509,253 @@ func TestAntigravityReasoningReplayHomeReadNormalizesAndRejectsMixedInvalidChain
 	}
 	if client.expireCount != 1 {
 		t.Fatalf("invalid Home read refreshed TTL: count=%d", client.expireCount)
+	}
+}
+
+func useAntigravityReasoningReplayDiskRoot(t *testing.T, root string) {
+	t.Helper()
+	SetAntigravityReasoningReplayCacheRoot(root)
+	t.Cleanup(func() {
+		SetAntigravityReasoningReplayCacheRoot("")
+	})
+}
+
+// resetAntigravityReasoningReplayMemoryOnly simulates a process restart by
+// clearing only the in-memory map, leaving any persisted files untouched.
+func resetAntigravityReasoningReplayMemoryOnly(t *testing.T) {
+	t.Helper()
+	antigravityReasoningReplayMu.Lock()
+	antigravityReasoningReplayEntries = make(map[string]antigravityReasoningReplayEntry)
+	antigravityReasoningReplayNextRevision = 0
+	antigravityReasoningReplayEvictionEpoch = 0
+	antigravityReasoningReplayMu.Unlock()
+}
+
+func TestAntigravityReplayDiskRestartHydration(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-restart"
+	item := antigravityReplayTestItem("disk-restart-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	path, ok := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if !ok {
+		t.Fatal("valid key rejected by path derivation")
+	}
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("persisted file missing after cache write: %v", errStat)
+	}
+	resetAntigravityReasoningReplayMemoryOnly(t)
+	items, ok := GetAntigravityReasoningReplayItems(model, session)
+	if !ok || len(items) != 1 || !bytes.Contains(items[0], []byte("disk-restart-signature")) {
+		t.Fatalf("restart read = %q, found=%v; want persisted entry", items, ok)
+	}
+	key := antigravityReasoningReplayCacheKey(model, session)
+	antigravityReasoningReplayMu.Lock()
+	_, hydrated := antigravityReasoningReplayEntries[key]
+	antigravityReasoningReplayMu.Unlock()
+	if !hydrated {
+		t.Fatal("restart read did not hydrate the in-memory map")
+	}
+}
+
+func TestAntigravityReplayDiskReplacementPersists(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-replace"
+	prefix := antigravityReplayTestItem("disk-replace-prefix-123456")
+	middle := antigravityReplayTestItem("disk-replace-middle-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{prefix}) {
+		t.Fatal("prefix write failed")
+	}
+	_, snapshot, found, errGet := GetAntigravityReasoningReplayItemsWithSnapshotRequired(context.Background(), model, session)
+	if errGet != nil || !found {
+		t.Fatalf("snapshot read failed: found=%v err=%v", found, errGet)
+	}
+	if swapped, errSwap := ReplaceAntigravityReasoningReplayItemsIfUnchanged(context.Background(), model, session, snapshot, [][]byte{prefix, middle}); errSwap != nil || !swapped {
+		t.Fatalf("conditional replace = %v, %v", swapped, errSwap)
+	}
+	resetAntigravityReasoningReplayMemoryOnly(t)
+	items, ok := GetAntigravityReasoningReplayItems(model, session)
+	if !ok || len(items) != 2 || !bytes.Contains(items[0], []byte("disk-replace-prefix")) || !bytes.Contains(items[1], []byte("disk-replace-middle")) {
+		t.Fatalf("replacement not persisted: %q found=%v", items, ok)
+	}
+}
+
+func TestAntigravityReplayDiskConditionalDeleteRemovesFile(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-cond-delete"
+	item := antigravityReplayTestItem("disk-cond-delete-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("persisted file missing after cache write: %v", errStat)
+	}
+	_, snapshot, found, errGet := GetAntigravityReasoningReplayItemsWithSnapshotRequired(context.Background(), model, session)
+	if errGet != nil || !found {
+		t.Fatalf("snapshot read failed: found=%v err=%v", found, errGet)
+	}
+	if deleted, errDelete := DeleteAntigravityReasoningReplayItemsIfUnchanged(context.Background(), model, session, snapshot); errDelete != nil || !deleted {
+		t.Fatalf("conditional delete = %v, %v", deleted, errDelete)
+	}
+	if _, errStat := os.Lstat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("persisted file survives conditional delete: %v", errStat)
+	}
+	resetAntigravityReasoningReplayMemoryOnly(t)
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); ok || len(items) != 0 {
+		t.Fatalf("deleted state resurrected after restart: %q found=%v", items, ok)
+	}
+}
+
+func TestAntigravityReplayDiskUnconditionalDeleteRemovesFile(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-unc-delete"
+	item := antigravityReplayTestItem("disk-unc-delete-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("persisted file missing after cache write: %v", errStat)
+	}
+	if errDelete := DeleteAntigravityReasoningReplayItemRequired(context.Background(), model, session); errDelete != nil {
+		t.Fatal(errDelete)
+	}
+	if _, errStat := os.Lstat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("persisted file survives unconditional delete: %v", errStat)
+	}
+	resetAntigravityReasoningReplayMemoryOnly(t)
+	if items, ok := GetAntigravityReasoningReplayItems(model, session); ok || len(items) != 0 {
+		t.Fatalf("deleted state resurrected after restart: %q found=%v", items, ok)
+	}
+}
+
+func TestAntigravityReplayDiskExpiryCleanupRemovesFile(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-expiry"
+	item := antigravityReplayTestItem("disk-expiry-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	key := antigravityReasoningReplayCacheKey(model, session)
+	path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("persisted file missing after cache write: %v", errStat)
+	}
+	antigravityReasoningReplayMu.Lock()
+	expiredEntry := antigravityReasoningReplayEntries[key]
+	expiredEntry.Timestamp = time.Now().Add(-2 * AntigravityReasoningReplayCacheTTL)
+	antigravityReasoningReplayEntries[key] = expiredEntry
+	antigravityReasoningReplayMu.Unlock()
+	if items, found := GetAntigravityReasoningReplayItems(model, session); found || len(items) != 0 {
+		t.Fatalf("expired entry returned as a hit: %q found=%v", items, found)
+	}
+	if _, errStat := os.Lstat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("expired persisted file survives read-path cleanup: %v", errStat)
+	}
+
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("second cache write failed")
+	}
+	antigravityReasoningReplayMu.Lock()
+	expiredEntry = antigravityReasoningReplayEntries[key]
+	expiredEntry.Timestamp = time.Now().Add(-2 * AntigravityReasoningReplayCacheTTL)
+	antigravityReasoningReplayEntries[key] = expiredEntry
+	antigravityReasoningReplayMu.Unlock()
+	purgeExpiredAntigravityReasoningReplayCache(time.Now())
+	if _, errStat := os.Lstat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("expired persisted file survives background purge: %v", errStat)
+	}
+}
+
+func TestAntigravityReplayDiskClearRemovesFiles(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model = "gemini-3.6-flash-high"
+	for _, session := range []string{"disk-clear-1", "disk-clear-2", "disk-clear-3"} {
+		if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{antigravityReplayTestItem("disk-clear-signature-123456")}) {
+			t.Fatal("cache write failed")
+		}
+	}
+	if entries, errList := os.ReadDir(root); errList != nil || len(entries) != 3 {
+		t.Fatalf("cache dir = %d entries, err %v; want 3", len(entries), errList)
+	}
+	ClearAntigravityReasoningReplayCache()
+	if entries, errList := os.ReadDir(root); errList == nil && len(entries) != 0 {
+		t.Fatalf("clear left %d persisted files", len(entries))
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, "disk-clear-1"); ok || len(items) != 0 {
+		t.Fatalf("cleared state resurrected: %q found=%v", items, ok)
+	}
+}
+
+func TestAntigravityReplayDiskCorruptFileIsMissNotProvenance(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-corrupt"
+	item := antigravityReplayTestItem("disk-corrupt-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if errWrite := os.WriteFile(path, []byte(`{"items": [[`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	resetAntigravityReasoningReplayMemoryOnly(t)
+	items, found, errGet := GetAntigravityReasoningReplayItemsRequired(context.Background(), model, session)
+	if errGet != nil || found || len(items) != 0 {
+		t.Fatalf("corrupt disk state = %q found=%v err=%v; want miss without error", items, found, errGet)
+	}
+	if _, errStat := os.Lstat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("corrupt file not removed: %v", errStat)
+	}
+}
+
+func TestAntigravityReplayDiskHydratedSnapshotFencesStaleMutation(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	root := t.TempDir()
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "disk-fence"
+	oldItem := antigravityReplayTestItem("disk-fence-old-signature-123456")
+	newItem := antigravityReplayTestItem("disk-fence-new-signature-123456")
+	staleItem := antigravityReplayTestItem("disk-fence-stale-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{oldItem}) {
+		t.Fatal("initial write failed")
+	}
+	resetAntigravityReasoningReplayMemoryOnly(t)
+	_, snapshot, found, errGet := GetAntigravityReasoningReplayItemsWithSnapshotRequired(context.Background(), model, session)
+	if errGet != nil || !found {
+		t.Fatalf("hydrated snapshot read failed: found=%v err=%v", found, errGet)
+	}
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{newItem}) {
+		t.Fatal("newer write failed")
+	}
+	if swapped, errSwap := ReplaceAntigravityReasoningReplayItemsIfUnchanged(context.Background(), model, session, snapshot, [][]byte{staleItem}); errSwap != nil || swapped {
+		t.Fatalf("stale replace after hydration = %v, %v; want false, nil", swapped, errSwap)
+	}
+	items, ok := GetAntigravityReasoningReplayItems(model, session)
+	if !ok || len(items) != 1 || !bytes.Contains(items[0], []byte("disk-fence-new")) {
+		t.Fatalf("newer state lost after hydrated stale replace: %q found=%v", items, ok)
 	}
 }
