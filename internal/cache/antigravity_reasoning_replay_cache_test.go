@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -757,5 +758,80 @@ func TestAntigravityReplayDiskHydratedSnapshotFencesStaleMutation(t *testing.T) 
 	items, ok := GetAntigravityReasoningReplayItems(model, session)
 	if !ok || len(items) != 1 || !bytes.Contains(items[0], []byte("disk-fence-new")) {
 		t.Fatalf("newer state lost after hydrated stale replace: %q found=%v", items, ok)
+	}
+}
+
+func TestAntigravityReplayCacheRootUnderAuthDir(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	authDir := t.TempDir()
+	root := filepath.Join(authDir, "antigravity-replay")
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model, session = "gemini-3.6-flash-high", "auth-dir-root"
+	item := antigravityReplayTestItem("auth-dir-root-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+	path, ok := newAntigravityReasoningReplayDiskStore(root).pathFor(model, session)
+	if !ok {
+		t.Fatal("valid key rejected by path derivation")
+	}
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("persisted file missing below cache root: %v", errStat)
+	}
+	info, errStat := os.Stat(root)
+	if errStat != nil {
+		t.Fatalf("cache root %s missing after write: %v", root, errStat)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("cache root permissions %o allow group/other access", info.Mode().Perm())
+	}
+	entries, errList := os.ReadDir(root)
+	if errList != nil {
+		t.Fatal(errList)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("cache root contains unexpected entries: %v", entries)
+	}
+	authEntries, errListAuth := os.ReadDir(authDir)
+	if errListAuth != nil {
+		t.Fatal(errListAuth)
+	}
+	if len(authEntries) != 1 || authEntries[0].Name() != "antigravity-replay" {
+		t.Fatalf("replay state leaked outside the cache root: %v", authEntries)
+	}
+}
+
+func TestAntigravityReplayCacheEmptyRootDisablesPersistence(t *testing.T) {
+	ClearAntigravityReasoningReplayCache()
+	t.Cleanup(ClearAntigravityReasoningReplayCache)
+	authDir := t.TempDir()
+	root := filepath.Join(authDir, "antigravity-replay")
+	useAntigravityReasoningReplayDiskRoot(t, root)
+	const model = "gemini-3.6-flash-high"
+	item := antigravityReplayTestItem("empty-root-signature-123456")
+	if !CacheAntigravityReasoningReplayItems(model, "empty-root-enabled", [][]byte{item}) {
+		t.Fatal("cache write with configured root failed")
+	}
+	path, _ := newAntigravityReasoningReplayDiskStore(root).pathFor(model, "empty-root-enabled")
+	if _, errStat := os.Lstat(path); errStat != nil {
+		t.Fatalf("persisted file missing while root configured: %v", errStat)
+	}
+
+	// An empty root restores the in-memory-only behavior: writes must not
+	// touch disk and reads must still serve the memory entry.
+	SetAntigravityReasoningReplayCacheRoot("")
+	if !CacheAntigravityReasoningReplayItems(model, "empty-root-disabled", [][]byte{item}) {
+		t.Fatal("cache write with disabled root failed")
+	}
+	if items, ok := GetAntigravityReasoningReplayItems(model, "empty-root-disabled"); !ok || len(items) != 1 {
+		t.Fatalf("in-memory write with disabled root not readable: %q found=%v", items, ok)
+	}
+	entries, errList := os.ReadDir(root)
+	if errList != nil {
+		t.Fatal(errList)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("write with empty root persisted %d files, want 1", len(entries))
 	}
 }
