@@ -404,7 +404,8 @@ func resolveAuthDirAbsolute(cfg *config.Config) (string, error) {
 // [RULES / NOTES]
 //   - An empty root restores the original in-memory-only behavior.
 //   - Called from Run after AuthDir is resolved and before request handling,
-//     and again from applyConfigRuntime whenever runtime configuration changes.
+//     and from applyConfigRuntime only after a runtime update fully succeeds,
+//     so a failed update never moves the root ahead of live runtime behavior.
 //
 // @param cfg the active service configuration.
 func (s *Service) configureAntigravityReplayCache(cfg *config.Config) {

@@ -1,6 +1,7 @@
 package cliproxy
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -308,5 +309,51 @@ func TestReplayCacheConfigUpdateHomeDisablesRoot(t *testing.T) {
 
 	if _, errStat := os.Lstat(oldRoot); !os.IsNotExist(errStat) {
 		t.Fatalf("Home mode update left local replay persistence active: %v", errStat)
+	}
+}
+
+// TestReplayCacheConfigUpdateFailureKeepsRoot verifies that a runtime config
+// update which fails partway through does not move the process-global replay
+// root ahead of the runtime behavior that failed to apply.
+func TestReplayCacheConfigUpdateFailureKeepsRoot(t *testing.T) {
+	isolateGlobalHomeClient(t)
+	cache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(func() {
+		cache.ClearAntigravityReasoningReplayCache()
+		cache.SetAntigravityReasoningReplayCacheRoot("")
+	})
+
+	authDirA := t.TempDir()
+	startupCfg := &config.Config{AuthDir: authDirA, Host: "127.0.0.1", Port: 0}
+	service := newReplayCacheServiceForTest(t, startupCfg)
+	if errEnsure := service.ensureAuthDir(); errEnsure != nil {
+		t.Fatalf("ensureAuthDir() error = %v", errEnsure)
+	}
+	service.configureAntigravityReplayCache(startupCfg)
+	wantRoot := filepath.Join(authDirA, "antigravity-replay")
+
+	// A later runtime step (pprof) fails; the update as a whole must fail.
+	service.applyPprofConfigContextFn = func(context.Context, *config.Config) bool { return false }
+	authDirB := t.TempDir()
+	updatedCfg := &config.Config{AuthDir: authDirB, Host: "127.0.0.1", Port: 0}
+	if applied := service.applyConfigUpdateWithAuthSynthesis(context.Background(), updatedCfg, false); applied {
+		t.Fatal("runtime apply unexpectedly succeeded with failing pprof step")
+	}
+
+	const model, session = "gemini-3.6-flash-high", "failed-update-session"
+	item := []byte(`{"type":"thought_signature","thoughtSignature":"failed-update-signature-1234567890"}`)
+	if !cache.CacheAntigravityReasoningReplayItems(model, session, [][]byte{item}) {
+		t.Fatal("replay cache write failed")
+	}
+
+	entries, errReadDir := os.ReadDir(wantRoot)
+	if errReadDir != nil {
+		t.Fatalf("replay root lost after failed runtime update: %v", errReadDir)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("replay root has %d entries, want 1", len(entries))
+	}
+	if _, errStat := os.Lstat(filepath.Join(authDirB, "antigravity-replay")); !os.IsNotExist(errStat) {
+		t.Fatalf("replay root moved despite failed runtime update: %v", errStat)
 	}
 }

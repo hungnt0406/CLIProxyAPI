@@ -129,11 +129,6 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 
-	// Re-wire the replay cache root on every accepted runtime configuration
-	// (watcher reloads and Home payloads). Home mode and unresolvable auth
-	// directories disable local persistence.
-	s.configureAntigravityReplayCache(cfg)
-
 	if !s.applyManagerConfig(ctx, commit) {
 		return false
 	}
@@ -185,7 +180,17 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 	s.syncPluginModelRuntime(registrationCtx)
-	return ctx.Err() == nil
+	if errContext := ctx.Err(); errContext != nil {
+		return false
+	}
+
+	// The runtime update fully succeeded (manager, pprof, server clients,
+	// plugins, and executors are consistent). Only now move the
+	// process-global replay root so a failed or cancelled update can never
+	// leave it ahead of the runtime behavior that is actually in effect.
+	// Home mode and unresolvable auth directories disable local persistence.
+	s.configureAntigravityReplayCache(cfg)
+	return true
 }
 
 func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) bool {
