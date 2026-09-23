@@ -41,6 +41,18 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - `sdk/cliproxy/` — Embeddable SDK entry (service/builder/watchers/pipeline)
 - `test/` — Cross-module integration tests
 
+## Syncing with upstream
+- Upstream source of truth: https://github.com/router-for-me/CLIProxyAPI/ (remote `origin`; a personal fork remote may also exist, e.g. `fork`)
+- To pull the latest upstream code without touching personal config files:
+  1. `git fetch origin`
+  2. If tracked personal files have uncommitted changes (e.g. `config.personal.yaml`), stash them first: `git stash push -u -m "personal config edits before pulling upstream" -- config.personal.yaml`
+  3. `git merge origin/main --no-edit` (or rebase, per the human's preference) to bring in upstream commits
+  4. Restore personal edits: `git stash pop`
+  5. Verify: `go build -o /tmp/opencode/test-cliproxy ./cmd/server && rm -f /tmp/opencode/test-cliproxy`
+- Never overwrite or auto-resolve conflicts in these personal/local files in favor of upstream: `config.yaml` (gitignored runtime config), `config.personal.yaml` (personal template/secrets), `.env`, and anything under `auths/`. If upstream and local changes conflict in one of these files, stop and ask the human how to resolve it instead of picking a side.
+- `config.yaml` is gitignored and untracked, so a normal fetch/merge of `origin/main` never touches it — no special handling needed beyond not `git add`-ing it.
+- `config.example.yaml` is upstream-owned reference config; always let it update normally from upstream (it is not a personal file).
+
 ## Code Conventions
 - Keep changes small and simple (KISS)
 - Comments in English only
